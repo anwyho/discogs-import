@@ -85,8 +85,12 @@ end
 
 wrapper = T.unsafe(CachedDiscogs.new)
 
-sig { params(image_uri: T.nilable(URI::Generic)).void }
-def print_image(image_uri)
+sig { params(images_array: T::Array[T.untyped]).void }
+def print_image(images_array)
+  image = images_array.find { |image| image['type'] == 'primary' } || 
+    images_array.find { |image| image['type'] == 'primary' } || 
+    images_array.first
+  image_uri = URI.parse(image&.dig('uri')) rescue nil
   if image_uri.nil?
     puts 'NO IMAGE FOUND'
   elsif image_uri.is_a?(URI::HTTPS)
@@ -159,6 +163,7 @@ get_artist_albums.each do |artist, album|
   album_search_index_hash = JSON.parse(indexes_file == '' ? '{}' : indexes_file)
   skip = T.let(album_search_index_hash.key?(artist_album_key), T::Boolean)
   index = album_search_index_hash[artist_album_key] || 0
+  master_id = T.let(search_results[index]['id'], T.nilable(Integer))
   while !skip
     master_id = T.let(search_results[index]['id'], T.nilable(Integer))
     master = T.let(wrapper.get_master_release(master_id), T.untyped)
@@ -168,11 +173,7 @@ get_artist_albums.each do |artist, album|
     end
 
     puts "\n\n#{artist} - #{album} (#{master_id})"
-    image = master['images'].find { |image| image['type'] == 'primary' } || 
-      master['images'].find { |image| image['type'] == 'primary' } || 
-      master['images'].first
-    image_uri = URI.parse(image&.dig('uri')) rescue nil
-    print_image(image_uri)
+    print_image(master['images'])
 
     loop do
       print "Is this the correct album? (Y/n/[m]issing/?): "
