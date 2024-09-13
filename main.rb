@@ -16,19 +16,19 @@ require 'logger'
 
 extend T::Sig
 
+PROJECT_NAME = ENV.fetch('PROJECT_NAME', 'discogs-import')
 DISCOGS_USERNAME = ENV.fetch('DISCOGS_USERNAME', 'unspecified-user')
 DISCOGS_USER_TOKEN = ENV.fetch('DISCOGS_USER_TOKEN', 'unspecified-token')
 SUPPRESS_WARNINGS = ENV.fetch('SUPPRESS_WARNINGS', 'false')
 CACHE_DIR = ENV.fetch('CACHE_DIR', './cache/')
 VERBOSE_CACHE = ENV.fetch('VERBOSE_CACHE', 'false')
-PROJECT_NAME = ENV.fetch('PROJECT_NAME', 'discogs-import')
+CORRECTED_ALBUM_SEARCH_INDEXES_FILE = ENV.fetch('CORRECTED_ALBUM_SEARCH_INDEXES_FILE', 'corrected_album_search_indexes.json')
 
 if SUPPRESS_WARNINGS == 'true'
+  # Hashie::Mash is a dependency of the 6yo discogs-wrapper gem and is very noisy
   logger = Logger.new(STDOUT)
   logger.level = Logger::ERROR
   Object.const_get(:Hashie).logger = logger
-
-  old_stderr = $stderr
   $stderr = File.open(File::NULL, 'w')
 end
 
@@ -49,6 +49,8 @@ class CachedDiscogs
 
   sig { params(method: Symbol, args: T.untyped).returns(T.untyped) }
   def method_missing(method, *args)
+    # I can't believe I'm using method_missing, but this kinda makes the caching clean.
+    # And it's not like Sorbet can help with the gem return values anyway.
     if @methods_to_cache.include?(method)
       T.unsafe(self).send(:cached_call, method, *args)
     else
@@ -69,7 +71,7 @@ class CachedDiscogs
     else
       puts 'CACHE MISS' if @verbose
       response = @wrapper.send(method, *args)
-      sleep(1)
+      sleep(1) # Don't slam the Discogs API - they have a rate limit
       result = response.to_hash.to_json
       File.write(cache_file, result)
     end
@@ -79,7 +81,10 @@ class CachedDiscogs
 
   sig { params(method: Symbol, args: T.untyped).returns(T.untyped) }
   def call(method, *args)
-    @wrapper.send(method, *args)
+    response = @wrapper.send(method, *args)
+    sleep(1) # Don't slam the Discogs API - they have a rate limit
+    result = response.to_hash.to_json
+    JSON.parse(result)
   end
 end
 
@@ -88,12 +93,14 @@ wrapper = T.unsafe(CachedDiscogs.new)
 sig { params(images_array: T::Array[T.untyped]).void }
 def print_image(images_array)
   image = images_array.find { |image| image['type'] == 'primary' } || 
-    images_array.find { |image| image['type'] == 'primary' } || 
+    images_array.find { |image| image['type'] == 'secondary' } || 
     images_array.first
-  image_uri = URI.parse(image&.dig('uri')) rescue nil
-  if image_uri.nil?
+  image_uri = image&.dig('uri') || ''
+  # really trying not to feed random internet-provded strings into my command line
+  case (URI.parse(image_uri))
+  when nil
     puts 'NO IMAGE FOUND'
-  elsif image_uri.is_a?(URI::HTTPS)
+  when URI::HTTPS
     system("~/.iterm2/imgcat --preserve-aspect-ratio -W 12 --url '#{image_uri}'")
   else
     puts "Invalid image URI: #{image_uri}"
@@ -102,40 +109,43 @@ end
 
 sig { returns(T::Array[[String, String]]) }
 def get_artist_albums
-  inside_collection = T.let(false, T::Boolean)
-  tuples = []
 
+  # ATTENTION: This whole method will need to be tweaked to return the artist-album tuples from whatever source.
+
+  inside_collection = T.let(false, T::Boolean)
+  inside_table = T.let(false, T::Boolean)
+  tuples = []
   File.foreach('/Users/anthony.ho/Documents/a bugs life/3 Resources/records/Records.md') do |line|
     if line.strip == "## Collection"
       inside_collection = true
       next
     end
 
-    # Stop parsing if a new section (heading starting with ## or ###) is encountered
     if inside_collection && line.start_with?("##")
       inside_collection = false
       next
     end
 
-    # Extract the table data once we are inside the "## Collection" section
-    if inside_collection && line.start_with?("|")
-      # Skip the header and separator rows
-      next if line.include?("Album") || line.include?("---")
+    # skip header row
+    if !inside_table && line.include?("Album")
+      inside_table = true
+      next
+    end
 
-      # Use CSV to handle the table row and split it into columns
+    # skip separator row
+    next if line.include?("-------------")
+
+    if inside_table && line.start_with?("|")
       row = CSV.parse_line(line, col_sep: '|')&.compact&.map(&:strip)
       raise "Invalid row: #{line}" if row.nil? || row.empty?
-      album, artist, *_rest = row # Assuming "Album" is the first column after index 0
+      album, artist, *_rest = row
 
-      # Append the tuple [artist, album] if both exist
       tuples << [artist, album]
     end
   end
 
   tuples
 end
-
-CORRECTED_ALBUM_SEARCH_INDEXES_FILE = 'corrected_album_search_indexes.json'
 
 sig { params(index: T.nilable(Integer), artist: String, album: String).void }
 def set_album_search_index(index:, artist:, album:)
@@ -161,11 +171,11 @@ get_artist_albums.each do |artist, album|
   FileUtils.touch(CORRECTED_ALBUM_SEARCH_INDEXES_FILE)
   indexes_file = File.read(CORRECTED_ALBUM_SEARCH_INDEXES_FILE)
   album_search_index_hash = JSON.parse(indexes_file == '' ? '{}' : indexes_file)
-  skip = T.let(album_search_index_hash.key?(artist_album_key), T::Boolean)
+  found_index = T.let(album_search_index_hash.key?(artist_album_key), T::Boolean)
   index = album_search_index_hash[artist_album_key] || 0
   master_id = T.let(search_results[index]['id'], T.nilable(Integer))
-  while !skip
-    master_id = T.let(search_results[index]['id'], T.nilable(Integer))
+  while !found_index
+    master_id = search_results[index]['id']
     master = T.let(wrapper.get_master_release(master_id), T.untyped)
     if master.nil? || master.empty?
       puts "500: Discog error - master #{master_id} not found for #{[artist, album]}: \n#{response}"
@@ -177,9 +187,9 @@ get_artist_albums.each do |artist, album|
 
     loop do
       print "Is this the correct album? (Y/n/[m]issing/?): "
-      case (response = gets.chomp)
+      case gets.chomp
       when 'y'
-        skip = true 
+        found_index = true 
         set_album_search_index(index:, artist:, album:)
       when 'n'
         if index == search_results.length - 1
@@ -190,11 +200,11 @@ get_artist_albums.each do |artist, album|
         end
       when 'm'
         puts 'Marking album as missing...'
-        skip = true
+        found_index = true
         set_album_search_index(index: nil, artist:, album:)
         missing_albums << [artist, album]
       when '?'
-        skip = true
+        found_index = true
         missing_albums << [artist, album]
       else
         puts 'Invalid response. Please enter "y" for yes, "n" for no, "m" for missing, or "?" for unsure.'
@@ -215,10 +225,12 @@ gets
 
 master_releases_by_main_release_id = master_ids
   .map { |id| wrapper.get_master_release(id) }
+  # inefficient .index_by implementation:
   .group_by { |master_release| master_release['main_release'] }
-  .transform_values { |master_releases| master_releases.first }
+  .transform_values { |master_releases| master_releases.last }
 
 master_releases_by_main_release_id.each do |release_id, master|
+  # roll the credits
   print_image(master['images'])
   wrapper.add_release_to_user_wantlist(DISCOGS_USERNAME, release_id, { rating: 0 })
   sleep(2)
