@@ -210,8 +210,16 @@ end
 puts 'Missing albums:'
 pp missing_albums
 
-# TODO: add to Discogs Want list
+puts "\n\nAbout to add the above albums to your Discogs wantlist. Press enter to continue..."
+gets
 
+master_releases_by_main_release_id = master_ids
+  .map { |id| wrapper.get_master_release(id) }
+  .group_by { |master_release| master_release['main_release'] }
+  .transform_values { |master_releases| master_releases.first }
 
-debugger
-
+master_releases_by_main_release_id.each do |release_id, master|
+  print_image(master['images'])
+  wrapper.add_release_to_user_wantlist(DISCOGS_USERNAME, release_id, { rating: 0 })
+  sleep(2)
+end
