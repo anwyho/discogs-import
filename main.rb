@@ -208,7 +208,7 @@ get_artist_albums.each do |artist, album|
 end
 
 puts 'Missing albums:'
-pp missing_albums
+missing_albums.each { |artist, album| puts "#{artist} - #{album}" }
 
 puts "\n\nAbout to add the above albums to your Discogs wantlist. Press enter to continue..."
 gets
